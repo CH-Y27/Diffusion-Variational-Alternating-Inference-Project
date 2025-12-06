@@ -1,0 +1,12 @@
+pandas
+numpy
+scipy
+scikit-learn
+openpyxl
+tqdm
+matplotlib
+seaborn
+tensorflow
+torch>=2.0.0
+matplotlib>=3.7.0
+#python -m pip install -r requirements.txt（command to install）
