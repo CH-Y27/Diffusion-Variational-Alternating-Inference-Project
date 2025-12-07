@@ -18,7 +18,7 @@ from tasks.linear_regression import BayesianLinearRegression
 # VB: FullCov Gaussian VB
 from vb.fullcov_gvb import FullCovGaussianVB
 
-# 可视化（使用你原来的版本，不改）
+# 可视化
 from visualization.plot_posteriors import plot_posterior_dvai
 
 # 扩散填补器
@@ -51,14 +51,14 @@ def main():
         X_t_full,
         y_t_full,
         noise_var=data_config.noise_std ** 2,
-        prior_var=1.0,
+        prior_var=1.0,      # 基线：N(0, I) 先验
     )
 
     vb_full = FullCovGaussianVB(dim=D, cfg=fullcov_vb_config, device=device)
     res_full = vb_full.fit(model_full)
 
-    mu_full = res_full["mu"]
-    cov_full = res_full["cov"]
+    mu_full = res_full["mu"]   # np[D]
+    cov_full = res_full["cov"] # np[D,D]
 
     # ======================
     # 3. 生成缺失 + 均值填补，得到 t=0 的 X_imp
@@ -68,7 +68,7 @@ def main():
     X_imp_current = X_imp0.copy()   # t=0 的填补数据
 
     # ======================
-    # 4. 初始化扩散填补器（后续 warm-start）
+    # 4. 初始化扩散填补器 + 变分先验
     # ======================
     imputer = SimpleDiffusionImputer(
         dim_x=D,
@@ -78,7 +78,13 @@ def main():
         device=device,
     )
 
+    # DVAI 第 0 轮先验：N(0, I)
+    prior_mean_t = torch.zeros(D, dtype=torch.float32, device=device)
+    prior_prec_t = torch.eye(D, dtype=torch.float32, device=device)
+
     mu_prev = None
+    cov_prev = None
+
     print(f"[DVAI] 外层迭代 K = {dvai_config.max_outer_iter}")
     ensure_dir("results")
 
@@ -88,7 +94,7 @@ def main():
     for t in range(dvai_config.max_outer_iter + 1):
         print(f"\n========== DVAI 迭代 t = {t} ==========")
 
-        # 5.1 当前填补数据上做 VB
+        # 5.1 当前填补数据上做 VB（使用动态先验）
         X_t = torch.tensor(X_imp_current, dtype=torch.float32, device=device)
         y_t = torch.tensor(y, dtype=torch.float32, device=device)
 
@@ -96,30 +102,41 @@ def main():
             X_t,
             y_t,
             noise_var=data_config.noise_std ** 2,
-            prior_var=1.0,
+            # 关键：上一轮后验作为这一轮先验
+            prior_mean=prior_mean_t,
+            prior_prec=prior_prec_t,
         )
 
         vb_t = FullCovGaussianVB(dim=D, cfg=fullcov_vb_config, device=device)
+
+        # （可选）用上一轮的 q(θ) warm-start 当前轮的变分参数
+        if mu_prev is not None and cov_prev is not None:
+            vb_t.mu.data = torch.tensor(mu_prev, dtype=torch.float32, device=device)
+            cov_prev_t = torch.tensor(cov_prev, dtype=torch.float32, device=device)
+            jitter_ws = 1e-6 * torch.eye(D, device=device)
+            L_init = torch.linalg.cholesky(cov_prev_t + jitter_ws)
+            vb_t.L_unconstrained.data = L_init
+
         res_vb_t = vb_t.fit(model_t)
 
-        mu_t = res_vb_t["mu"]
-        cov_t = res_vb_t["cov"]
+        mu_t = res_vb_t["mu"]           # np[D]
+        cov_t = res_vb_t["cov"]         # np[D,D]
         elbo_t = res_vb_t["elbo_history"]
 
-        # 5.2 可视化（沿用你原来的函数签名）
+        # 5.2 可视化 —— 用关键字参数避免顺序错误
         fig_path = f"results/posterior_dvai_iter{t}.png"
         plot_posterior_dvai(
-            theta_true,
-            mu_full,
-            cov_full,
-            mu_t,
-            cov_t,
-            elbo_t,
-            fig_path,
+            mu_full_vb=mu_full,
+            cov_full_vb=cov_full,
+            mu_dvai=mu_t,
+            cov_dvai=cov_t,
+            theta_true=theta_true,
+            elbo_history=elbo_t,
+            save_path=fig_path,
         )
         print(f"[Viz] t={t} 图已保存: {fig_path}")
 
-        # 5.3 收敛检查
+        # 5.3 收敛检查（基于参数均值）
         if mu_prev is not None:
             delta = np.linalg.norm(mu_t - mu_prev)
             print(f"[Check] ||mu(t)-mu(t-1)|| = {delta:.6f}")
@@ -127,7 +144,15 @@ def main():
                 print(">>> DVAI 收敛，停止迭代")
                 break
 
+        # 更新“上一轮后验”
         mu_prev = mu_t.copy()
+        cov_prev = cov_t.copy()
+
+        # 更新下一轮的先验：N(mu_t, cov_t)
+        prior_mean_t = torch.tensor(mu_t, dtype=torch.float32, device=device)
+        cov_torch = torch.tensor(cov_t, dtype=torch.float32, device=device)
+        jitter = 1e-6 * torch.eye(D, device=device)
+        prior_prec_t = torch.linalg.inv(cov_torch + jitter)
 
         # 最后一轮不再训练扩散 & 填补
         if t == dvai_config.max_outer_iter:

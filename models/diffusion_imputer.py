@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from .diffusion_model import MLPDiffusion, Precond, EDMLoss
-from .diffusion_utils import impute_mask   # ⭐ 关键改动：从 utils 导入
+from .diffusion_utils import impute_mask   # 混合采样填补
 
 # ----------------------------------------------------------
 # 简化版 DVAI 用扩散填补器（带标准化 & 数值保护）
@@ -106,7 +106,7 @@ class SimpleDiffusionImputer:
                 dim=D,
                 num_steps=self.num_steps,
                 device=self.device,
-                N_inner=5,   # 仍然使用你之前设定的 inner 步数
+                N_inner=5,
             )
             samples.append(Z_j)
 
