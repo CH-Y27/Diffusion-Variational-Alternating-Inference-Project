@@ -25,7 +25,7 @@ from tqdm import trange
 
 @dataclass
 class FullCovVBConfig:
-    n_iter: int = 20000          # 最大迭代次数
+    n_iter: int = 10000          # 最大迭代次数
     mc_samples: int = 20         # 每步 MC 样本数 S
     lr: float = 1e-3             # Adam 学习率
     grad_clip: float = 50.0      # 梯度裁剪阈值

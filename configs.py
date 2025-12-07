@@ -6,12 +6,12 @@ from dataclasses import dataclass
 
 @dataclass
 class FullCovVBConfig:
-    n_iter: int = 20000
-    mc_samples: int = 20
+    n_iter: int = 10000
+    mc_samples: int = 50
     lr: float = 1e-3
     grad_clip: float = 50.0
     lb_smooth: int = 50
-    patience: int = 500
+    patience: int = 1000
 
 
 
@@ -19,7 +19,7 @@ class FullCovVBConfig:
 @dataclass
 class DataConfig:
     n_samples: int = 2000
-    dim_x: int = 20
+    dim_x: int = 50
     noise_std: float = 0.3
     seed: int = 42
     data_dir: str = "data"
@@ -44,10 +44,10 @@ class NAGVACConfig:
 
 @dataclass
 class MCMCConfig:
-    n_iter: int = 100000          # 总迭代次数（对应 NumMCMC）
-    burn_in_rate: float = 0.2     # Burn-in 比例（对应 BurnInRate）
+    n_iter: int = 80000          # 总迭代次数（对应 NumMCMC）
+    burn_in_rate: float = 0.3     # Burn-in 比例（对应 BurnInRate）
     target_accept: float = 0.25   # 目标接受率（TargetAccept）
-    num_covariance: int = 2000    # 用最近多少个样本估计协方差（NumCovariance）
+    num_covariance: int = 1000    # 用最近多少个样本估计协方差（NumCovariance）
     sig_scale: float = 0.01       # 初始协方差尺度（SigScale）
     init_scale: float = 1.0       # 初始 proposal 缩放因子（Scale）
     thin: int = 1                 # thinning 步长（原文没细用，可以先设 1）

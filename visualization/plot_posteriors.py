@@ -1,3 +1,4 @@
+# visualization/plot_posteriors.py
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import norm
@@ -23,6 +24,11 @@ def plot_posterior_comparison(
         - VB 后验 N(mu, cov)
         - MCMC 样本密度
         - ELBO 曲线
+
+    可视化改进：
+        - VB、MCMC 后验密度曲线下方使用浅色填充，提高美观度；
+        - 每个维度的 x 轴范围设为 VB 均值 ± 4 * 标准差，
+          避免展示密度极低的区域（如需更宽可自行调节倍数）。
     """
 
     # ------ 统一形状为 1D / diag ------
@@ -42,29 +48,41 @@ def plot_posterior_comparison(
     dim_to_plot = min(max_dim, D)
 
     fig, axes = plt.subplots(3, 3, figsize=(15, 15))
-    xs = np.linspace(-3, 3, 500)
 
     for i in range(dim_to_plot):
         ax = axes[i // 3, i % 3]
 
-        # VB posterior
+        # VB posterior 参数
         mu_vb = float(vb_mu[i])
         sigma_vb = float(vb_sigma[i])
-        ax.plot(xs, norm.pdf(xs, mu_vb, sigma_vb),
-                color="red", label="VB")
+
+        # 根据高斯分布特性设置 x 范围：均值 ± 4σ
+        x_min = mu_vb - 4.0 * sigma_vb
+        x_max = mu_vb + 4.0 * sigma_vb
+        xs = np.linspace(x_min, x_max, 500)
+
+        # VB posterior 密度
+        vb_density = norm.pdf(xs, mu_vb, sigma_vb)
+        # 填充 + 曲线
+        ax.fill_between(xs, vb_density, alpha=0.2, color="red")
+        ax.plot(xs, vb_density, color="red", label="VB")
 
         # MCMC posterior (kernel density estimate)
         samples = mcmc_samples[:, i]
         if len(samples) > 10:
             from scipy.stats import gaussian_kde
             kde = gaussian_kde(samples)
-            ax.plot(xs, kde(xs), color="green", label="MCMC KDE")
+            kde_density = kde(xs)
+
+            ax.fill_between(xs, kde_density, alpha=0.2, color="green")
+            ax.plot(xs, kde_density, color="green", label="MCMC KDE")
 
         # True theta
         ax.axvline(float(theta_true[i]), color="black", linestyle="--", label="True")
 
+        ax.set_xlim(x_min, x_max)
         ax.set_title(f"θ_{i}")
-        ax.grid(True)
+        ax.grid(True, alpha=0.3)
 
         if i == 0:
             ax.legend()
@@ -74,7 +92,7 @@ def plot_posterior_comparison(
     ax_elbo.plot(elbo_history, color="purple")
     ax_elbo.set_title("ELBO Curve")
     ax_elbo.set_xlabel("Iteration")
-    ax_elbo.grid(True)
+    ax_elbo.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(save_path)
@@ -104,6 +122,11 @@ def plot_posterior_dvai(
         - 红色：DVAI 当前轮 VB 高斯密度
         - 黑色虚线：真实 θ
         - 右下角：本轮 VB 的 ELBO 曲线
+
+    可视化改进：
+        - Full-VB 与 DVAI-VB 的高斯曲线均使用填充区；
+        - 每个维度的 x 轴范围为两条高斯均值 ± 4σ 的并集，
+          聚焦主要质量区域，便于肉眼比较。
     """
 
     # ---------- 统一为 1D 向量 ----------
@@ -128,7 +151,6 @@ def plot_posterior_dvai(
     sigma_dvai = extract_sigma(cov_dvai, D)
 
     fig, axes = plt.subplots(3, 3, figsize=(15, 15))
-    xs = np.linspace(-3, 3, 500)
 
     # ----------------------------------------
     # 绘制前 dim_to_plot 个参数的高斯密度
@@ -142,13 +164,25 @@ def plot_posterior_dvai(
         mu_d = float(mu_dvai[i])
         sigma_d = float(sigma_dvai[i])
 
+        # 根据两条高斯的均值 ± 4σ 共同确定合适的显示区间
+        x_min_f = mu_f - 4.0 * sigma_f
+        x_max_f = mu_f + 4.0 * sigma_f
+        x_min_d = mu_d - 4.0 * sigma_d
+        x_max_d = mu_d + 4.0 * sigma_d
+
+        x_min = min(x_min_f, x_min_d)
+        x_max = max(x_max_f, x_max_d)
+        xs = np.linspace(x_min, x_max, 500)
+
         # 完备数据 VB
-        ax.plot(xs, norm.pdf(xs, mu_f, sigma_f),
-                color="blue", label="Full-data VB")
+        full_density = norm.pdf(xs, mu_f, sigma_f)
+        ax.fill_between(xs, full_density, alpha=0.2, color="blue")
+        ax.plot(xs, full_density, color="blue", label="Full-data VB")
 
         # DVAI 当前轮 VB
-        ax.plot(xs, norm.pdf(xs, mu_d, sigma_d),
-                color="red", label="DVAI VB")
+        dvai_density = norm.pdf(xs, mu_d, sigma_d)
+        ax.fill_between(xs, dvai_density, alpha=0.2, color="red")
+        ax.plot(xs, dvai_density, color="red", label="DVAI VB")
 
         # True θ
         ax.axvline(float(theta_true[i]), linestyle="--", color="black", label="True θ")
@@ -156,8 +190,9 @@ def plot_posterior_dvai(
         if i == 0:
             ax.legend()
 
+        ax.set_xlim(x_min, x_max)
         ax.set_title(f"θ_{i}")
-        ax.grid(True)
+        ax.grid(True, alpha=0.3)
 
     # ----------------------------------------
     # ELBO 曲线绘制
@@ -166,7 +201,7 @@ def plot_posterior_dvai(
     ax_elbo.plot(elbo_history, color="purple")
     ax_elbo.set_title("ELBO (DVAI VB)")
     ax_elbo.set_xlabel("Iteration")
-    ax_elbo.grid(True)
+    ax_elbo.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(save_path)
