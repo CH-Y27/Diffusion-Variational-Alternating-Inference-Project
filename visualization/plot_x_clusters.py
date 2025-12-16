@@ -33,7 +33,7 @@ def plot_pairwise_scatter(X, labels, save_path):
     """绘制前4维的4×4散点矩阵（仅 scatter）"""
     dim = 4
     feature_names = [f"x[{i}]" for i in range(dim)]
-    colors = ["green", "blue"]
+    colors = ["#1f77b4", "#ff7f0e"]
     alpha = 0.5
 
     fig, axes = plt.subplots(dim, dim, figsize=(12, 12))

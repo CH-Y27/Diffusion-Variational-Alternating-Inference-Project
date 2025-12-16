@@ -6,8 +6,9 @@ import torch.nn as nn
 from .diffusion_model import MLPDiffusion, Precond, EDMLoss
 from .diffusion_utils import impute_mask   # 混合采样填补
 
+
 # ----------------------------------------------------------
-# 简化版 DVAI 用扩散填补器（带标准化 & 数值保护）
+# DVAI 用扩散填补器（标准化 + 数值保护 + 加强采样）
 # ----------------------------------------------------------
 class SimpleDiffusionImputer:
     """
@@ -16,17 +17,25 @@ class SimpleDiffusionImputer:
     - 内部自动维护列均值/方差用于标准化，外部接口始终用原尺度的 X
     """
 
-    def __init__(self, dim_x, hidden_dim=256, num_steps=30, J=3, device="cpu"):
+    def __init__(
+        self,
+        dim_x: int,
+        hidden_dim: int = 512,   # 加宽网络
+        num_steps: int = 50,     # 逆过程时间步数
+        J: int = 10,             # 条件采样次数
+        device: str = "cpu",
+    ):
         self.dim_x = dim_x
         self.hidden_dim = hidden_dim
         self.device = device
         self.num_steps = num_steps
         self.J = J
 
+        # 生成网络 + 预条件封装
         self.denoise_fn = MLPDiffusion(d_in=dim_x, dim_t=hidden_dim).to(device)
         self.precond = Precond(self.denoise_fn, hidden_dim).to(device)
         self.loss_fn = EDMLoss()
-        self.opt = torch.optim.Adam(self.precond.parameters(), lr=1e-4)
+        self.opt = torch.optim.Adam(self.precond.parameters(), lr=2e-4)
 
         # 标准化所需的统计量
         self.mean_ = None
@@ -39,7 +48,8 @@ class SimpleDiffusionImputer:
         """
         mean = np.nanmean(X, axis=0)
         std = np.nanstd(X, axis=0)
-        std[std < 1e-3] = 1.0   # 避免过小方差引起放大
+        # 避免过小方差造成数值放大
+        std[std < 1e-3] = 1.0
 
         self.mean_ = mean
         self.std_ = std
@@ -59,14 +69,17 @@ class SimpleDiffusionImputer:
         return Z * (self.std_ * 2.0) + self.mean_
 
     # ---------------- 训练：在标准化空间上训练 EDM ----------------
-    def train_model(self, X: np.ndarray, iters: int = 80):
+    def train_model(self, X: np.ndarray, iters: int = 150):
         """
         X: 当前填补后的数据 (N, D)，原尺度
+        - 每一轮都会重新拟合标准化参数，使 scaler 适应最新填补数据
         """
         # 更新标准化参数，并将 X 映射到标准化空间
-        Z = self._transform(X)      # (N, D) 约在 [-1, 1]
+        self._fit_scaler(X)
+        Z = self._transform(X)          # (N, D) 约在 [-1, 1]
         Z_t = torch.tensor(Z, dtype=torch.float32, device=self.device)
 
+        self.precond.train()
         for k in range(iters):
             loss_vec = self.loss_fn(self.precond, Z_t)
             loss = loss_vec.mean()
@@ -97,30 +110,34 @@ class SimpleDiffusionImputer:
         N, D = Z_t.shape
         samples = []
 
+        # J 次独立条件采样，最后取均值近似 E[x | x_obs]
         for j in range(self.J):
-            Z_j = impute_mask(
-                self.precond,
-                Z_t,
-                mask_t,
+            Z_sample = impute_mask(
+                net=self.precond,
+                x=Z_t,
+                mask=mask_t,
                 num_samples=N,
                 dim=D,
                 num_steps=self.num_steps,
                 device=self.device,
-                N_inner=5,
+                N_inner=20,   # 比之前更细的 inner step
             )
-            samples.append(Z_j)
+            samples.append(Z_sample)
 
         Z_mean = torch.stack(samples).mean(0).cpu().numpy()
         X_new = self._inverse_transform(Z_mean)
 
-        # --------- 数值保护：处理 NaN/Inf + 截断 ----------
+        # --------- 数值保护：处理 NaN/Inf ----------
         bad = ~np.isfinite(X_new)
         if bad.any():
             num_bad = bad.sum()
             print(f"[Diffusion][Warn] impute 产生 {num_bad} 个非有限值，回退到上一轮 X")
             X_new[bad] = X_current[bad]
 
-        # 软截断，避免极端大值污染 VB
-        X_new = np.clip(X_new, -10.0, 10.0)
+        # 软截断：根据列标准差设一个较宽的范围，避免极端大值
+        if self.std_ is not None:
+            max_std = float(np.max(self.std_))
+            bound = 6.0 * max_std   # 约 6σ
+            X_new = np.clip(X_new, -bound, bound)
 
         return X_new
