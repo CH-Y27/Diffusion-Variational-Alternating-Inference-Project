@@ -1,26 +1,21 @@
 # untils/io_utils.py
-from pathlib import Path
 import numpy as np
-import pandas as pd
+from pathlib import Path
+
 
 def ensure_dir(path: str | Path):
-    p = Path(path)
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    Path(path).mkdir(parents=True, exist_ok=True)
 
-def save_csv(array: np.ndarray, path: str | Path):
+
+def save_csv(path: str | Path, arr: np.ndarray):
+    """
+    正确签名：save_csv(path, array)
+    """
     path = Path(path)
     ensure_dir(path.parent)
-    df = pd.DataFrame(array)
-    df.to_csv(path, index=False)
+    np.savetxt(path, arr, delimiter=",")
+
 
 def load_csv(path: str | Path) -> np.ndarray:
-    return pd.read_csv(path).to_numpy()
-
-def save_npy(array: np.ndarray, path: str | Path):
     path = Path(path)
-    ensure_dir(path.parent)
-    np.save(path, array)
-
-def load_npy(path: str | Path) -> np.ndarray:
-    return np.load(path)
+    return np.loadtxt(path, delimiter=",")

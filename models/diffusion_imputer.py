@@ -1,143 +1,199 @@
 # models/diffusion_imputer.py
+# Train + sample DDPM for tabular imputation with inpainting constraints.
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Optional
+
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
 
-from .diffusion_model import MLPDiffusion, Precond, EDMLoss
-from .diffusion_utils import impute_mask   # 混合采样填补
+from .diffusion_model import MLPDenoiser
+from .diffusion_utils import DiffusionSchedule, apply_inpainting_constraint
 
 
-# ----------------------------------------------------------
-# DVAI 用扩散填补器（标准化 + 数值保护 + 加强采样）
-# ----------------------------------------------------------
-class SimpleDiffusionImputer:
-    """
-    - 训练阶段：用 EDM loss 在当前 "填补后 X" 上训练 score 网络
-    - 采样阶段：在标准化空间用 impute_mask 在缺失位置生成新值
-    - 内部自动维护列均值/方差用于标准化，外部接口始终用原尺度的 X
-    """
+@dataclass
+class DiffusionImputerConfig:
+    T: int = 500                 # fewer steps -> faster CPU
+    beta_start: float = 1e-4
+    beta_end: float = 2e-2
+    hidden: int = 256
+    n_layers: int = 4
+    t_embed_dim: int = 128
+    dropout: float = 0.0
 
-    def __init__(
-        self,
-        dim_x: int,
-        hidden_dim: int = 512,   # 加宽网络
-        num_steps: int = 50,     # 逆过程时间步数
-        J: int = 10,             # 条件采样次数
-        device: str = "cpu",
-    ):
-        self.dim_x = dim_x
-        self.hidden_dim = hidden_dim
-        self.device = device
-        self.num_steps = num_steps
-        self.J = J
+    # training
+    lr: float = 2e-4
+    batch_size: int = 256
+    epochs: int = 10
+    grad_clip: float = 1.0
+    ema: float = 0.999
 
-        # 生成网络 + 预条件封装
-        self.denoise_fn = MLPDiffusion(d_in=dim_x, dim_t=hidden_dim).to(device)
-        self.precond = Precond(self.denoise_fn, hidden_dim).to(device)
-        self.loss_fn = EDMLoss()
-        self.opt = torch.optim.Adam(self.precond.parameters(), lr=2e-4)
+    # sampling
+    sample_steps: int = 200      # <= T; using a subset speeds up
+    num_impute_samples: int = 8  # Monte Carlo samples per row
+    clamp_val: float = 6.0       # keep values bounded in standardized space
 
-        # 标准化所需的统计量
-        self.mean_ = None
-        self.std_ = None
 
-    # ---------------- 内部：拟合 & 使用 scaler ----------------
-    def _fit_scaler(self, X: np.ndarray):
-        """
-        对当前填补后的 X 拟合列均值和标准差
-        """
-        mean = np.nanmean(X, axis=0)
-        std = np.nanstd(X, axis=0)
-        # 避免过小方差造成数值放大
-        std[std < 1e-3] = 1.0
+class EMA:
+    def __init__(self, model: nn.Module, decay: float):
+        self.decay = decay
+        self.shadow: Dict[str, torch.Tensor] = {}
+        for k, v in model.state_dict().items():
+            self.shadow[k] = v.detach().clone()
 
-        self.mean_ = mean
-        self.std_ = std
-
-    def _transform(self, X: np.ndarray) -> np.ndarray:
-        """
-        映射到标准化空间，大致在 [-1, 1] 范围
-        """
-        if self.mean_ is None or self.std_ is None:
-            self._fit_scaler(X)
-        return (X - self.mean_) / (self.std_ * 2.0)
-
-    def _inverse_transform(self, Z: np.ndarray) -> np.ndarray:
-        """
-        从标准化空间映回原尺度
-        """
-        return Z * (self.std_ * 2.0) + self.mean_
-
-    # ---------------- 训练：在标准化空间上训练 EDM ----------------
-    def train_model(self, X: np.ndarray, iters: int = 150):
-        """
-        X: 当前填补后的数据 (N, D)，原尺度
-        - 每一轮都会重新拟合标准化参数，使 scaler 适应最新填补数据
-        """
-        # 更新标准化参数，并将 X 映射到标准化空间
-        self._fit_scaler(X)
-        Z = self._transform(X)          # (N, D) 约在 [-1, 1]
-        Z_t = torch.tensor(Z, dtype=torch.float32, device=self.device)
-
-        self.precond.train()
-        for k in range(iters):
-            loss_vec = self.loss_fn(self.precond, Z_t)
-            loss = loss_vec.mean()
-            if not torch.isfinite(loss):
-                print(f"[Diffusion][Warn] loss 非有限（{loss.item()}），提前停止本轮训练")
-                break
-
-            self.opt.zero_grad()
-            loss.backward()
-            self.opt.step()
-
-            if k % 20 == 0:
-                print(f"[Diffusion] step {k}/{iters}, loss={loss.item():.4f}")
-
-    # ---------------- 采样：在标准化空间填补，再映回原尺度 ----------------
     @torch.no_grad()
-    def impute(self, X_current: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    def update(self, model: nn.Module):
+        for k, v in model.state_dict().items():
+            self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1 - self.decay)
+
+    @torch.no_grad()
+    def copy_to(self, model: nn.Module):
+        model.load_state_dict(self.shadow, strict=True)
+
+
+class DiffusionImputer:
+    """
+    Unconditional DDPM on completed X, used as an imputer via inpainting during sampling.
+    """
+
+    def __init__(self, x_dim: int, device: torch.device, cfg: Optional[DiffusionImputerConfig] = None):
+        self.cfg = cfg or DiffusionImputerConfig()
+        self.device = device
+
+        self.schedule = DiffusionSchedule(
+            T=self.cfg.T,
+            beta_start=self.cfg.beta_start,
+            beta_end=self.cfg.beta_end,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        self.net = MLPDenoiser(
+            x_dim=x_dim,
+            hidden=self.cfg.hidden,
+            n_layers=self.cfg.n_layers,
+            t_embed_dim=self.cfg.t_embed_dim,
+            dropout=self.cfg.dropout,
+        ).to(device)
+
+        self.ema = EMA(self.net, decay=self.cfg.ema)
+
+    def fit(self, X_complete: np.ndarray, verbose: bool = True) -> Dict[str, list]:
         """
-        X_current: (N, D) 当前一轮的填补数据（原尺度）
-        mask:      (N, D) 1=缺失, 0=观测
-        返回: 新一轮填补后的 X_new（原尺度）
+        Train epsilon-predictor on the current completed dataset (standardized recommended).
         """
-        # 用当前 scaler 把输入映射到标准化空间
-        Z = self._transform(X_current)     # (N, D)
-        Z_t = torch.tensor(Z, dtype=torch.float32, device=self.device)
-        mask_t = torch.tensor(mask, dtype=torch.int, device=self.device)
+        X = torch.tensor(X_complete, device=self.device, dtype=torch.float32)
+        ds = TensorDataset(X)
+        dl = DataLoader(ds, batch_size=self.cfg.batch_size, shuffle=True, drop_last=True)
 
-        N, D = Z_t.shape
-        samples = []
+        opt = torch.optim.Adam(self.net.parameters(), lr=self.cfg.lr)
 
-        # J 次独立条件采样，最后取均值近似 E[x | x_obs]
-        for j in range(self.J):
-            Z_sample = impute_mask(
-                net=self.precond,
-                x=Z_t,
-                mask=mask_t,
-                num_samples=N,
-                dim=D,
-                num_steps=self.num_steps,
-                device=self.device,
-                N_inner=20,   # 比之前更细的 inner step
-            )
-            samples.append(Z_sample)
+        history = {"loss": []}
+        self.net.train()
 
-        Z_mean = torch.stack(samples).mean(0).cpu().numpy()
-        X_new = self._inverse_transform(Z_mean)
+        pbar = range(self.cfg.epochs)
+        if verbose:
+            pbar = tqdm(pbar, desc="Diffusion-train", leave=False)
 
-        # --------- 数值保护：处理 NaN/Inf ----------
-        bad = ~np.isfinite(X_new)
-        if bad.any():
-            num_bad = bad.sum()
-            print(f"[Diffusion][Warn] impute 产生 {num_bad} 个非有限值，回退到上一轮 X")
-            X_new[bad] = X_current[bad]
+        for _ in pbar:
+            epoch_loss = 0.0
+            n = 0
+            for (x0,) in dl:
+                B = x0.shape[0]
+                t = torch.randint(0, self.schedule.T, (B,), device=self.device, dtype=torch.long)
+                noise = torch.randn_like(x0)
 
-        # 软截断：根据列标准差设一个较宽的范围，避免极端大值
-        if self.std_ is not None:
-            max_std = float(np.max(self.std_))
-            bound = 6.0 * max_std   # 约 6σ
-            X_new = np.clip(X_new, -bound, bound)
+                sa = self.schedule.sqrt_alpha_bar[t].view(-1, 1)
+                so = self.schedule.sqrt_one_minus_alpha_bar[t].view(-1, 1)
+                x_t = sa * x0 + so * noise
 
-        return X_new
+                pred = self.net(x_t, t)
+                loss = torch.mean((pred - noise) ** 2)
+
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                if self.cfg.grad_clip is not None and self.cfg.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.cfg.grad_clip)
+                opt.step()
+                self.ema.update(self.net)
+
+                epoch_loss += float(loss.item()) * B
+                n += B
+
+            history["loss"].append(epoch_loss / max(n, 1))
+
+        # use EMA weights for sampling
+        self.ema.copy_to(self.net)
+        self.net.eval()
+        return history
+
+    @torch.no_grad()
+    def impute(self, X_obs: np.ndarray, obs_mask: np.ndarray) -> np.ndarray:
+        """
+        X_obs: (N, D) with any filler values at missing entries.
+        obs_mask: (N, D) 1 for observed, 0 for missing.
+
+        Returns: imputed X (N, D) using MC average over num_impute_samples.
+        """
+        cfg = self.cfg
+        schedule = self.schedule
+        net = self.net
+
+        x0_obs = torch.tensor(X_obs, device=self.device, dtype=torch.float32)
+        m = torch.tensor(obs_mask, device=self.device, dtype=torch.float32)
+
+        N, D = x0_obs.shape
+        S = cfg.num_impute_samples
+
+        # choose a subset of timesteps for fast sampling
+        steps = min(cfg.sample_steps, schedule.T)
+        t_seq = torch.linspace(schedule.T - 1, 0, steps, device=self.device).long()
+
+        out = torch.zeros((S, N, D), device=self.device, dtype=torch.float32)
+
+        for s in range(S):
+            x_t = torch.randn((N, D), device=self.device, dtype=torch.float32)
+
+            # initial enforce at max t
+            noise_obs = torch.randn_like(x_t)
+            x_t = apply_inpainting_constraint(x_t, x0_obs, m, schedule, t_seq[0].expand(N), noise=noise_obs)
+
+            for i in range(len(t_seq)):
+                t = t_seq[i].expand(N)
+                t_prev = t_seq[i + 1].expand(N) if i + 1 < len(t_seq) else torch.zeros_like(t)
+
+                beta_t = schedule.betas[t].view(-1, 1)
+                alpha_t = schedule.alphas[t].view(-1, 1)
+                alpha_bar_t = schedule.alpha_bar[t].view(-1, 1)
+                alpha_bar_prev = schedule.alpha_bar[t_prev].view(-1, 1)
+
+                eps = net(x_t, t)
+
+                # x0 estimate
+                x0_hat = (x_t - torch.sqrt(1 - alpha_bar_t) * eps) / torch.sqrt(alpha_bar_t)
+                x0_hat = torch.clamp(x0_hat, -cfg.clamp_val, cfg.clamp_val)
+
+                # DDPM posterior mean
+                coef1 = torch.sqrt(alpha_bar_prev) * beta_t / (1 - alpha_bar_t)
+                coef2 = torch.sqrt(alpha_t) * (1 - alpha_bar_prev) / (1 - alpha_bar_t)
+                mu = coef1 * x0_hat + coef2 * x_t
+
+                var = schedule.posterior_variance[t].view(-1, 1)
+                if i + 1 < len(t_seq):
+                    z = torch.randn_like(x_t)
+                    x_t = mu + torch.sqrt(torch.clamp(var, min=1e-20)) * z
+                else:
+                    x_t = mu  # last step (t=0)
+
+                # enforce observed entries (inpainting) at the current t_prev level
+                noise_obs = torch.randn_like(x_t)
+                x_t = apply_inpainting_constraint(x_t, x0_obs, m, schedule, t_prev, noise=noise_obs)
+
+            out[s] = x_t
+
+        x_imp = out.mean(dim=0).detach().cpu().numpy()
+        return x_imp

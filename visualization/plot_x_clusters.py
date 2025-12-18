@@ -6,7 +6,7 @@ import sys
 from sklearn.cluster import KMeans
 
 # ============================================================
-# 关键：获取项目根目录 ROOT（保证 data/ 能被找到）
+# 获取项目根目录 ROOT（保证 data/ 能被找到）
 # ============================================================
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -24,16 +24,22 @@ def load_x_data():
 
 
 def cluster_x(X, n_clusters=2, seed=42):
-    """使用前四维做 KMeans 聚类用于着色"""
+    """
+    使用前 4 维真实特征做 KMeans 聚类用于着色
+    注意：这里的 X 已经是不含 intercept 的数据
+    """
     kmeans = KMeans(n_clusters=n_clusters, random_state=seed, n_init="auto")
     return kmeans.fit_predict(X[:, :4])
 
 
 def plot_pairwise_scatter(X, labels, save_path):
-    """绘制前4维的4×4散点矩阵（仅 scatter）"""
+    """
+    绘制前 4 维的 4×4 散点矩阵（仅 scatter）
+    X: 不含 intercept 的真实协变量
+    """
     dim = 4
-    feature_names = [f"x[{i}]" for i in range(dim)]
-    colors = ["#1f77b4", "#ff7f0e"]
+    feature_names = [f"x[{i}]" for i in range(dim)]  # 标签保持 x[0] ~ x[3]
+    colors = ["green","blue" ]
     alpha = 0.5
 
     fig, axes = plt.subplots(dim, dim, figsize=(12, 12))
@@ -71,20 +77,23 @@ def plot_pairwise_scatter(X, labels, save_path):
 
 
 def main():
-    # 1. 加载数据
-    X = load_x_data()
+    # 1. 加载完整数据（含 intercept）
+    X_full = load_x_data()
 
-    # 2. 聚类用于着色
+    # 2. 去掉 intercept，只保留真实协变量
+    X = X_full[:, 1:]
+
+    # 3. 聚类用于着色（基于真实特征）
     labels = cluster_x(X)
 
-    # 3. 输出路径
+    # 4. 输出路径
     save_path = ROOT / "results" / "x_pairwise_scatter.png"
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 4. 绘制 4×4 scatter matrix
+    # 5. 绘制前 4 维 scatter matrix（忽略 intercept）
     plot_pairwise_scatter(X, labels, save_path)
 
-    print(f"[Viz] 前4维散点矩阵已保存至：{save_path}")
+    print(f"[Viz] 前4维（忽略 intercept）散点矩阵已保存至：{save_path}")
 
 
 if __name__ == "__main__":

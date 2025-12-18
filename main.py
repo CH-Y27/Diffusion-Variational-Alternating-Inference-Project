@@ -1,197 +1,225 @@
 # main.py
 import numpy as np
 import torch
+from pathlib import Path
 
-# configs
-from configs import data_config, fullcov_vb_config, dvai_config
+from configs import data_config, fullcov_vb_config, dvai_config, diff_config
 
-# utils
 from untils.seed_device import set_global_seed, get_device
-from untils.io_utils import load_csv, ensure_dir
+from untils.io_utils import ensure_dir, load_csv, save_csv
 
-# missing data
-from generate_miss.generate_missing import generate_mcar_missing
+from generate_miss.data_generation import generate_logistic_data
 
-# 线性回归贝叶斯模型（带 log_joint 方法）
-from tasks.linear_regression import BayesianLinearRegression
+# ====== 兼容你的 data_miss.py 不同函数名 ======
+try:
+    from generate_miss.data_miss import apply_mcar_missing as _make_missing
+except ImportError:
+    from generate_miss.data_miss import make_mcar_missing as _make_missing
 
-# VB: FullCov Gaussian
+try:
+    from generate_miss.data_miss import save_mcar_outputs as _save_missing_outputs
+except ImportError:
+    _save_missing_outputs = None
+
+from tasks.logistic_regression import BayesianLogisticRegression
 from vb.fullcov_gvb import FullCovGaussianVB
 
-# 可视化
-from visualization.plot_posteriors import plot_posterior_dvai
+from models.diffusion_imputer import DiffusionImputer, DiffusionImputerConfig
 
-# 扩散填补器
-from models.diffusion_imputer import SimpleDiffusionImputer
+# 你的绘图函数若签名不同，请保持你本地版本调用方式
+from visualization.plot_posteriors import plot_posterior_comparison
 
 
-def eval_impute(X_true, X_imp, mask):
-    """
-    只在缺失位置上评估填补误差 (RMSE / MAE).
-    X_true : 完整数据 (N, D)
-    X_imp  : 当前填补数据 (N, D)
-    mask   : 缺失指示 (N, D)，1=缺失，0=观测
-    """
-    diff = X_imp[mask == 1] - X_true[mask == 1]
-    rmse = float(np.sqrt(np.mean(diff ** 2)))
-    mae = float(np.mean(np.abs(diff)))
-    return rmse, mae
+def force_intercept_col(X: np.ndarray) -> np.ndarray:
+    """强制截距列=1（第0列），且任何阶段都不允许改变"""
+    X[:, 0] = 1.0
+    return X
+
+
+def force_no_missing_on_intercept(mask_missing: np.ndarray) -> np.ndarray:
+    """mask_missing: 1=missing, 0=observed；强制截距列永不缺失"""
+    mask_missing[:, 0] = 0
+    return mask_missing
 
 
 def main():
     # ======================
-    # 1. 环境 & 完整数据读取
+    # 0) env
     # ======================
     set_global_seed(data_config.seed)
     device = get_device()
-    print(f"[Env] 使用设备: {device}")
-
-    X = load_csv("data/X_full.csv")                     # (N, D)
-    y = load_csv("data/y_full.csv").reshape(-1)         # (N,)
-    theta_true = load_csv("data/theta_true.csv").reshape(-1)
-
-    N, D = X.shape
-    print(f"[Data] 完整数据: N={N}, D={D}")
+    print(f"[Env] device = {device}")
 
     # ======================
-    # 2. 完备数据 FullCov-GVB baseline（固定先验 N(0, I)）
+    # 1) dirs
     # ======================
-    print("[VB-base] 完备数据 FullCov-GVB ...")
-    X_t_full = torch.tensor(X, dtype=torch.float32, device=device)
-    y_t_full = torch.tensor(y, dtype=torch.float32, device=device)
+    data_dir = Path("Data")
+    res_dir = Path("Results")
+    ensure_dir(data_dir)
+    ensure_dir(res_dir)
 
-    model_full = BayesianLinearRegression(
-        X_t_full,
-        y_t_full,
-        noise_var=data_config.noise_std ** 2,
-        prior_var=1.0,      # 完备数据 baseline：N(0, I) 先验
-    )
+    # ======================
+    # 2) load / generate full data
+    # ======================
+    X_path = data_dir / "X_full.csv"
+    y_path = data_dir / "y.csv"
+    theta_path = data_dir / "theta_true.csv"
 
+    if X_path.exists() and y_path.exists() and theta_path.exists():
+        print("[Data] loading csv ...")
+        X_full = load_csv(X_path).astype(np.float32)
+        y = load_csv(y_path).reshape(-1).astype(np.float32)
+        theta_true = load_csv(theta_path).reshape(-1).astype(np.float32)
+    else:
+        print("[Data] generating logistic data ...")
+        X_full, y, theta_true = generate_logistic_data(
+            n_samples=data_config.N,
+            dim_x=data_config.D,
+            seed=data_config.seed,
+        )
+        X_full = np.asarray(X_full, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32).reshape(-1)
+        theta_true = np.asarray(theta_true, dtype=np.float32).reshape(-1)
+
+        save_csv(X_path, X_full)
+        save_csv(y_path, y.reshape(-1, 1))
+        save_csv(theta_path, theta_true.reshape(-1, 1))
+
+    # 强制截距列
+    force_intercept_col(X_full)
+
+    N, D = X_full.shape
+    print(f"[Data] N={N}, D={D}")
+
+    X_full_t = torch.tensor(X_full, device=device, dtype=torch.float32)
+    y_t = torch.tensor(y, device=device, dtype=torch.float32)
+
+    # ======================
+    # 3) complete-data VB
+    # ======================
+    print("[VB] FullCov-GVB on complete data ...")
+    model_full = BayesianLogisticRegression(X_full_t, y_t)
     vb_full = FullCovGaussianVB(dim=D, cfg=fullcov_vb_config, device=device)
-    res_full = vb_full.fit(model_full)
+    out_full = vb_full.fit(model_full)
 
-    mu_full = res_full["mu"]        # np[D]
-    cov_full = res_full["cov"]      # np[D, D]
-
-    # ======================
-    # 3. 生成缺失 + 均值填补，得到 t=0 的填补数据
-    # ======================
-    print("[Missing] 生成 MCAR 缺失 + 均值填补 ...")
-    missing_rate = getattr(data_config, "missing_rate", 0.3)
-    X_obs, m_mask, col_means, X_imp0 = generate_mcar_missing(
-        X, missing_rate=missing_rate
-    )
-    X_imp_current = X_imp0.copy()   # t=0: 均值填补
+    vb_mu_full = out_full["mu"]
+    vb_cov_full = out_full["cov"]
+    vb_elbo_full = out_full["elbo_history"]
 
     # ======================
-    # 4. 初始化扩散填补器（加强版）
+    # 4) missing + mean init
     # ======================
-    imputer = SimpleDiffusionImputer(
-        dim_x=D,
-        hidden_dim=512,
-        num_steps=50,
-        J=10,
-        device=device,
+    print("[Missing] MCAR missing + mean init ...")
+
+    # 兼容函数名：_make_missing 可能返回 (X_miss, mask, X_init) 或别的排列
+    out_miss = _make_missing(
+        X_full=X_full,
+        missing_rate=getattr(data_config, "missing_rate", 0.3),
+        seed=getattr(data_config, "missing_seed", 123),
     )
 
-    mu_prev = None
-    cov_prev = None
-
-    print(f"[DVAI] 外层迭代 K = {dvai_config.max_outer_iter}")
-    ensure_dir("results")
-
-    # 训练迭代数（若 dvai_config 中没有该属性，就用 150）
-    diffusion_train_iters = getattr(dvai_config, "diffusion_train_iters", 150)
-
-    # ======================
-    # 5. DVAI 外层循环
-    # ======================
-    for t in range(dvai_config.max_outer_iter + 1):
-        print(f"\n========== DVAI 迭代 t = {t} ==========")
-
-        # 5.0 当前填补质量评估（仅在缺失位置）
-        rmse_t, mae_t = eval_impute(X, X_imp_current, m_mask)
-        print(f"[Impute] t={t}, RMSE={rmse_t:.6f}, MAE={mae_t:.6f}")
-
-        # 5.1 在当前填补数据上做 VB（固定先验 N(0, I)）
-        X_t = torch.tensor(X_imp_current, dtype=torch.float32, device=device)
-        y_t = torch.tensor(y, dtype=torch.float32, device=device)
-
-        model_t = BayesianLinearRegression(
-            X_t,
-            y_t,
-            noise_var=data_config.noise_std ** 2,
-            prior_var=1.0,   # 固定先验，不随 t 变化
+    if len(out_miss) == 3:
+        X_miss, mask_missing, X_init = out_miss
+    else:
+        raise RuntimeError(
+            f"[Missing] make/apply missing returned {len(out_miss)} outputs, expected 3."
         )
 
-        vb_t = FullCovGaussianVB(dim=D, cfg=fullcov_vb_config, device=device)
+    X_miss = np.asarray(X_miss, dtype=np.float32)
+    mask_missing = np.asarray(mask_missing, dtype=np.int32)  # 1=missing,0=obs（按你模块习惯）
+    X_init = np.asarray(X_init, dtype=np.float32)
 
-        # warm-start：用上一轮的变分结果初始化当前参数（加速收敛）
-        if mu_prev is not None and cov_prev is not None:
-            vb_t.mu.data = torch.tensor(mu_prev, dtype=torch.float32, device=device)
-            cov_prev_t = torch.tensor(cov_prev, dtype=torch.float32, device=device)
-            jitter_ws = 1e-6 * torch.eye(D, device=device)
-            L_init = torch.linalg.cholesky(cov_prev_t + jitter_ws)
-            vb_t.L_unconstrained.data = L_init
+    # 强制：截距列不缺失不填补
+    force_no_missing_on_intercept(mask_missing)
+    force_intercept_col(X_miss)
+    force_intercept_col(X_init)
 
-        res_vb_t = vb_t.fit(model_t)
-        mu_t = res_vb_t["mu"]            # np[D]
-        cov_t = res_vb_t["cov"]          # np[D, D]
-        elbo_t = res_vb_t["elbo_history"]
-
-        # 5.2 可视化
-        fig_path = f"results/posterior_dvai_iter{t}.png"
-        plot_posterior_dvai(
-            mu_full_vb=mu_full,
-            cov_full_vb=cov_full,
-            mu_dvai=mu_t,
-            cov_dvai=cov_t,
-            theta_true=theta_true,
-            elbo_history=elbo_t,
-            save_path=fig_path,
-        )
-        print(f"[Viz] t={t} 图已保存: {fig_path}")
-
-        # 5.3 收敛检查（基于参数均值）
-        if mu_prev is not None:
-            delta = np.linalg.norm(mu_t - mu_prev)
-            print(f"[Check] ||mu(t)-mu(t-1)|| = {delta:.6f}")
-            if delta < dvai_config.convergence_tol:
-                print(">>> DVAI 收敛，停止迭代")
-                break
-
-        # 保存当前轮的变分结果，供下一轮 warm-start 和最终评估
-        mu_prev = mu_t.copy()
-        cov_prev = cov_t.copy()
-
-        # 最后一轮不再做扩散训练与填补
-        if t == dvai_config.max_outer_iter:
-            break
-
-        # 5.4 在当前 X_imp_current 上训练扩散模型（加强版参数）
-        print("[Diffusion] 训练扩散模型 ...")
-        imputer.train_model(X_imp_current, iters=diffusion_train_iters)
-
-        # 5.5 用扩散模型对当前数据进行条件填补，生成下一轮的 X_imp
-        print("[Diffusion] 执行缺失填补 ...")
-        X_new = imputer.impute(X_imp_current, m_mask)
-
-        # 观测位置仍然锁死为真实观测值
-        X_new[m_mask == 0] = X_obs[m_mask == 0]
-
-        X_imp_current = X_new.copy()
+    # 可选保存（如果你的模块提供）
+    if _save_missing_outputs is not None:
+        miss_dir = data_dir / "Missing"
+        ensure_dir(miss_dir)
+        _save_missing_outputs(X_miss, mask_missing, X_init, data_dir=miss_dir)
 
     # ======================
-    # 6. 最终评估
+    # 5) DVAI outer loop
     # ======================
-    print("\n========== DVAI 最终评估 ==========")
-    print("|| 完备数据 VB - 真值 || =",
-          np.linalg.norm(mu_full - theta_true))
-    print("|| DVAI 最终参数 - 真值 || =",
-          np.linalg.norm(mu_prev - theta_true))
-    print("|| DVAI 最终参数 - 完备 VB || =",
-          np.linalg.norm(mu_prev - mu_full))
-    print("[Done] DVAI 全部完成！")
+    print(f"[DVAI] outer K={dvai_config.K}")
+
+    # obs_mask 给 imputer：1=observed, 0=missing（与 diffusion_imputer.impute 语义对齐）
+    obs_mask = 1 - mask_missing
+    obs_mask_feat = obs_mask[:, 1:]  # 去掉截距列
+
+    # 当前填补值
+    X_current = X_init.copy()
+
+    # Diffusion config（字段名按你 diffusion_imputer.py 的 DiffusionImputerConfig 对齐）
+    cfg_diff = DiffusionImputerConfig(
+        T=diff_config.T,
+        beta_start=diff_config.beta_start,
+        beta_end=diff_config.beta_end,
+        hidden=diff_config.hidden,
+        n_layers=diff_config.n_layers,
+        t_embed_dim=diff_config.t_embed_dim,
+        dropout=getattr(diff_config, "dropout", 0.0),
+        lr=diff_config.lr,
+        batch_size=diff_config.batch_size,
+        epochs=diff_config.epochs,
+        grad_clip=diff_config.grad_clip,
+        ema=diff_config.ema,
+        sample_steps=diff_config.sample_steps,
+        num_impute_samples=diff_config.num_impute_samples,
+        clamp_val=diff_config.clamp_val,
+    )
+
+    # 只对非截距列做扩散
+    imputer = DiffusionImputer(x_dim=D - 1, device=device, cfg=cfg_diff)
+
+    mu_prev = vb_mu_full.copy()
+
+    for k in range(dvai_config.K):
+        print(f"\n========== DVAI iter {k} ==========")
+
+        # (a) VB on current imputed data
+        Xk_t = torch.tensor(X_current, device=device, dtype=torch.float32)
+        model_k = BayesianLogisticRegression(Xk_t, y_t)
+
+        vb_k = FullCovGaussianVB(dim=D, cfg=fullcov_vb_config, device=device)
+        out_k = vb_k.fit(model_k)
+        mu_k = out_k["mu"]
+
+        diff_mu = float(np.linalg.norm(mu_k - mu_prev))
+        print(f"[Check] ||mu_k - mu_prev|| = {diff_mu:.6f}")
+        mu_prev = mu_k
+
+        # (b) diffusion train (fit) on features only
+        print("[Diffusion] training ...")
+        X_train_feat = X_current[:, 1:].astype(np.float32)
+        imputer.fit(X_train_feat, verbose=True)  # ✅ 你的类没有 train，只有 fit
+
+        # (c) diffusion impute features (inpainting)
+        print("[Diffusion] imputing ...")
+        X_obs_feat = X_current[:, 1:].astype(np.float32)
+        X_imp_feat = imputer.impute(X_obs=X_obs_feat, obs_mask=obs_mask_feat)
+
+        # (d) damping，防止每轮填补导致后验跑飞
+        eta = getattr(dvai_config, "impute_damping", 0.2)
+        X_current[:, 1:] = (1 - eta) * X_current[:, 1:] + eta * X_imp_feat
+        force_intercept_col(X_current)
+
+    # ======================
+    # 6) plot (complete-data reference)
+    # ======================
+    fig_path = res_dir / "posterior_compare_complete_logistic.png"
+    plot_posterior_comparison(
+        theta_true=theta_true,
+        vb_mu=vb_mu_full,
+        vb_cov=vb_cov_full,
+        mcmc_samples=None,
+        elbo_history=vb_elbo_full,
+        save_path=str(fig_path),
+        max_dim=8,
+    )
+    print(f"[Plot] saved to: {fig_path}")
 
 
 if __name__ == "__main__":
