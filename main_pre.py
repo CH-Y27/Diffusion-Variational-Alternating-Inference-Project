@@ -10,16 +10,13 @@ from generate_miss.data_generation import generate_logistic_data
 from tasks.logistic_regression import BayesianLogisticRegression
 from vb.fullcov_gvb import FullCovGaussianVB, FullCovGVBConfig
 from vb.mcmc_mala import run_mala
-
-# 你的可视化脚本如果还叫 plot_posteriors.py，可以继续用；
-# 这里假设你已有 plot_posterior_comparison(theta_true, vb_mu, vb_cov, mcmc_samples, elbo_history, save_path, max_dim)
 from visualization.plot_posteriors import plot_posterior_comparison
 
 
 def _map_init_lbfgs(model: BayesianLogisticRegression, iters: int = 200):
     """
     MAP = argmax log_joint(theta)
-    用 LBFGS 做一个稳定初始化（对齐 Matlab 例题用 MLE/MAP 初始化的做法）。
+    用 LBFGS 做稳定初始化。
     """
     device = model.X.device
     theta = torch.zeros(model.D, device=device, requires_grad=True)
@@ -28,7 +25,8 @@ def _map_init_lbfgs(model: BayesianLogisticRegression, iters: int = 200):
 
     def closure():
         opt.zero_grad(set_to_none=True)
-        loss = -model.log_joint(theta)[0]
+        # 关键修复：不要假设 log_joint 一定可索引 [0]
+        loss = -model.log_joint(theta).mean()
         loss.backward()
         return loss
 
@@ -59,7 +57,7 @@ def main():
             N=data_config.N,
             D=data_config.D,
             seed=data_config.seed,
-            prior_var=data_config.prior_var,
+            prior_var=data_config.prior_var,      # 与后续 DVAI 保持一致
             theta_scale=data_config.theta_scale,
             add_intercept=data_config.add_intercept,
             standardize=data_config.standardize,
@@ -88,7 +86,8 @@ def main():
         verbose=fullcov_vb_config.verbose,
     )
     vb = FullCovGaussianVB(dim=model.D, cfg=vb_cfg, device=device)
-    # 用 MAP 初始化 mu（对齐 Matlab 的 MLE/MAP 初始化会显著改善方差估计）
+
+    # MAP 初始化均值（通常能显著改善收敛与方差估计）
     with torch.no_grad():
         vb.mu.copy_(theta_map)
 
@@ -115,10 +114,10 @@ def main():
     with torch.no_grad():
         def lj(th):
             th = torch.tensor(th, device=device, dtype=torch.float32)
-            return float(model.log_joint(th)[0].item())
+            return float(model.log_joint(th).mean().item())  # 关键修复
 
         logp_true = lj(theta_true)
-        logp_map = float(model.log_joint(theta_map)[0].item())
+        logp_map = float(model.log_joint(theta_map).mean().item())
         logp_vb = lj(vb_mu)
         logp_mcmc = lj(mcmc_samples.mean(axis=0))
 
@@ -149,7 +148,7 @@ def main():
         vb_mu=vb_mu,
         vb_cov=vb_cov,
         mcmc_samples=mcmc_samples,
-        elbo_history=elbo_history,  # raw full length
+        elbo_history=elbo_history,
         save_path=str(save_path),
         max_dim=8,
     )

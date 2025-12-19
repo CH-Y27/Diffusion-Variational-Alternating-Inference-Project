@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from tqdm import trange
 
+
 def run_rwm(model, cfg, theta_init=None, seed: int = 42):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -20,7 +21,7 @@ def run_rwm(model, cfg, theta_init=None, seed: int = 42):
     verbose = cfg.verbose
 
     theta = torch.zeros(D, device=device) if theta_init is None else theta_init.detach().clone().to(device)
-    logp = model.log_joint(theta)[0].item()
+    logp = model.log_joint(theta).mean().item()  # 关键修复
 
     V = sig_scale * np.eye(D, dtype=np.float64)
     all_samples = np.zeros((n_iter, D), dtype=np.float64)
@@ -32,7 +33,7 @@ def run_rwm(model, cfg, theta_init=None, seed: int = 42):
         delta = scale * (L @ np.random.randn(D))
         prop = theta + torch.tensor(delta, dtype=theta.dtype, device=device)
 
-        logp_prop = model.log_joint(prop)[0].item()
+        logp_prop = model.log_joint(prop).mean().item()  # 关键修复
         if np.log(np.random.rand()) < (logp_prop - logp):
             theta = prop
             logp = logp_prop
